@@ -1,21 +1,21 @@
 // Waveshare ESP32-S3-ETH-8DI-8RO - grid relay chase
 //
 // Behaviour:
-//   First, relays 1-8 chase one at a time: relay N switches ON for 5s, then
-//   OFF, then relay N+1 switches ON, and so on through relay 8.
+//   loop() plays every pattern in PLAYLIST (bottom of this file) in order,
+//   then starts over, forever. Reorder / remove entries there to change the
+//   show. Patterns:
+//     runFullOnOff                 - all ON (staggered for inrush), hold, all OFF, hold
+//     runSingleChase               - relays 1-8 one at a time
+//     runCascade(ROWS/COLS)        - groups ON one after another, then OFF in the same order
+//     runFillDrain(ROWS/COLS)      - groups ON one after another, then OFF in reverse order
+//     runCheckerboard              - two alternating checkerboard halves of the grid
+//     runRowBounce                 - one row at a time, top -> bottom -> top
+//     runRandom                    - random relay mix, random hold times
+//     runMiddleRowOnOuterAlternate - top/bottom rows swap, middle row drops out
+//                                    for the last MIDDLE_OFF_PERCENT of each step
 //
-//   Then relays 1-8 are imagined as a 3x3 grid in reading order, with the 9th
-//   (bottom-right) cell missing:
-//       1 2 3
-//       4 5 6
-//       7 8 .
-//   The 3 rows switch ON one after another (5s apart), then (after a
-//   short pause) OFF in the same order. Then the same thing for the 3
-//   columns (col 3 only has 2 relays, since the bottom-right is missing).
-//   Then the top and bottom rows take turns being ON; the middle row comes
-//   on with each one and drops out for the last 30% of every step
-//   (runMiddleRowOnOuterAlternate).
-//   Then it repeats forever: rows, columns, middle row + outer rows, rows, ...
+//   Rows/columns come from the ROWS / COLS grid below, which matches the
+//   physical socket layout.
 //
 // Hardware note:
 //   The 8 relays are NOT wired to ESP32 GPIOs directly. They are driven by
@@ -89,6 +89,19 @@ static constexpr uint8_t SIDE_SWAPS = 6;
 // Middle row switches off for this last part of each step, before the swap.
 static constexpr uint32_t MIDDLE_OFF_PERCENT = 20;
 
+// runFullOnOff() timing. Relays switch on INRUSH_STAGGER_MS apart so the fans
+// don't all start at the same instant (0 = all in one I2C write).
+static constexpr uint32_t FULL_ON_MS        = 10000;
+static constexpr uint32_t FULL_OFF_MS       = 5000;
+static constexpr uint32_t INRUSH_STAGGER_MS = 50;
+
+// Repeat counts for the playlist patterns.
+static constexpr uint8_t CHECKER_SWAPS  = 8;
+static constexpr uint8_t BOUNCE_PASSES  = 3;
+static constexpr uint8_t RANDOM_STEPS   = 10;
+static constexpr uint32_t RANDOM_MIN_MS = 500;
+static constexpr uint32_t RANDOM_MAX_MS = 3000;
+
 static uint8_t relayBits = 0x00; // current shadow copy of the TCA9554 output register
 
 // Write one byte to a TCA9554 register. Returns true on success.
@@ -132,16 +145,38 @@ static void setGroup(const RelayGroup &group, bool on) {
   writeRelays();
 }
 
-// One relay-index blink + wait, shared by the row/column cascades below.
-static void heartbeatAndWait() {
+// Set all 8 relays from one logical mask (bit i = relay i+1 ON), one I2C write.
+static void setMask(uint8_t mask) {
+  for (uint8_t i = 0; i < NUM_RELAYS; i++) {
+    setRelayBit(i, mask & (1u << i));
+  }
+  writeRelays();
+}
+
+// Logical mask (bit i = relay i+1) of every relay in `group`.
+static uint8_t groupMask(const RelayGroup &group) {
+  uint8_t mask = 0;
+  for (uint8_t k = 0; k < group.count; k++) {
+    mask |= 1u << group.indices[k];
+  }
+  return mask;
+}
+
+// BLUE LED blink + wait `ms` in total. Safe for ms < 100.
+static void pulseAndWait(uint32_t ms) {
   rgbLedWrite(RGB_LED_PIN, 0, 0, 32); // BLUE pulse = loop() is alive and iterating
   delay(100);
   rgbLedWrite(RGB_LED_PIN, 0, 0, 0);
-  delay(STEP_INTERVAL_MS - 100);
+  if (ms > 100) delay(ms - 100);
 }
 
-// Switch each group in `groups` ON one after another (5s apart), then
-// (after a short pause) OFF in the same order.
+// One blink + one STEP_INTERVAL_MS wait, shared by the patterns below.
+static void heartbeatAndWait() {
+  pulseAndWait(STEP_INTERVAL_MS);
+}
+
+// Switch each group in `groups` ON one after another (STEP_INTERVAL_MS
+// apart), then (after a short pause) OFF in the same order.
 static void runCascade(const RelayGroup *groups, uint8_t numGroups, const char *label) {
   for (uint8_t g = 0; g < numGroups; g++) {
     setGroup(groups[g], true);
@@ -160,8 +195,97 @@ static void runCascade(const RelayGroup *groups, uint8_t numGroups, const char *
   delay(PHASE_PAUSE_MS);
 }
 
-// Simple 1->8 single-relay chase: each relay switches on for STEP_INTERVAL_MS
-// (5s), then off, before the next relay in line switches on.
+// Like runCascade(), but switches the groups OFF in reverse order, so the
+// grid fills up and then drains back down.
+static void runFillDrain(const RelayGroup *groups, uint8_t numGroups, const char *label) {
+  for (uint8_t g = 0; g < numGroups; g++) {
+    setGroup(groups[g], true);
+    Serial.printf("%s %u ON\n", label, g + 1);
+    heartbeatAndWait();
+  }
+
+  delay(PHASE_PAUSE_MS);
+
+  for (int8_t g = numGroups - 1; g >= 0; g--) {
+    setGroup(groups[g], false);
+    Serial.printf("%s %u OFF\n", label, g + 1);
+    heartbeatAndWait();
+  }
+
+  delay(PHASE_PAUSE_MS);
+}
+
+// Every relay ON, hold FULL_ON_MS, every relay OFF, hold FULL_OFF_MS.
+// Switch-on is staggered by INRUSH_STAGGER_MS to spread the fans' start-up current.
+static void runFullOnOff() {
+  for (uint8_t i = 0; i < NUM_RELAYS; i++) {
+    setRelayBit(i, true);
+    if (INRUSH_STAGGER_MS) {
+      writeRelays();
+      delay(INRUSH_STAGGER_MS);
+    }
+  }
+  writeRelays();
+  Serial.println("ALL ON");
+  pulseAndWait(FULL_ON_MS);
+
+  allRelaysOff();
+  Serial.println("ALL OFF");
+  pulseAndWait(FULL_OFF_MS);
+}
+
+// Two checkerboard halves of the grid take turns, CHECKER_SWAPS times.
+// Positions come from ROWS, so this follows the physical socket layout.
+static void runCheckerboard() {
+  uint8_t even = 0;
+  for (uint8_t r = 0; r < NUM_ROWS; r++) {
+    for (uint8_t k = 0; k < ROWS[r].count; k++) {
+      if ((r + k) % 2 == 0) even |= 1u << ROWS[r].indices[k];
+    }
+  }
+
+  for (uint8_t s = 0; s < CHECKER_SWAPS; s++) {
+    setMask(s % 2 ? (uint8_t)~even : even);
+    Serial.printf("Checker %s\n", s % 2 ? "B" : "A");
+    heartbeatAndWait();
+  }
+
+  allRelaysOff();
+  delay(PHASE_PAUSE_MS);
+}
+
+// One row ON at a time: top -> middle -> bottom -> middle -> ..., BOUNCE_PASSES
+// times. Each step is a single I2C write, so rows never overlap.
+static void runRowBounce() {
+  static const uint8_t order[] = {0, 1, 2, 1};
+  static constexpr uint8_t steps = sizeof(order) / sizeof(order[0]);
+
+  for (uint8_t p = 0; p < BOUNCE_PASSES * steps; p++) {
+    uint8_t row = order[p % steps];
+    setMask(groupMask(ROWS[row]));
+    Serial.printf("Row %u only\n", row + 1);
+    heartbeatAndWait();
+  }
+
+  allRelaysOff();
+  delay(PHASE_PAUSE_MS);
+}
+
+// RANDOM_STEPS random relay mixes, each held for a random time.
+static void runRandom() {
+  for (uint8_t s = 0; s < RANDOM_STEPS; s++) {
+    uint8_t mask = esp_random() & 0xFF;
+    setMask(mask);
+    Serial.printf("Random 0x%02X\n", mask);
+    pulseAndWait(random(RANDOM_MIN_MS, RANDOM_MAX_MS));
+  }
+
+  allRelaysOff();
+  delay(PHASE_PAUSE_MS);
+}
+
+// Simple 1->8 single-relay chase: each relay switches on for STEP_INTERVAL_MS,
+// then off, before the next relay in line switches on.
 
 static void runSingleChase() {
   for (uint8_t i = 0; i < NUM_RELAYS; i++) {
@@ -196,10 +320,7 @@ static void runMiddleRowOnOuterAlternate() {
     writeRelays(); // outer rows swap and middle comes on in the same I2C write
     Serial.println(topOn ? "Top + Middle ON, Bottom OFF" : "Bottom + Middle ON, Top OFF");
 
-    rgbLedWrite(RGB_LED_PIN, 0, 0, 32); // BLUE pulse = loop() is alive and iterating
-    delay(100);
-    rgbLedWrite(RGB_LED_PIN, 0, 0, 0);
-    delay(middleOnMs - 100);
+    pulseAndWait(middleOnMs);
 
     setGroup(middle, false);
     Serial.println("Middle OFF");
@@ -262,9 +383,24 @@ void setup() {
   delay(500);
 }
 
+// Patterns played in order by loop(), then repeated. Comment out / reorder
+// entries to change the show.
+using Pattern = void (*)();
+static const Pattern PLAYLIST[] = {
+ // runFullOnOff,
+ // runSingleChase,
+ // [] { runCascade(ROWS, NUM_ROWS, "Row"); },
+ // [] { runCascade(COLS, NUM_COLS, "Col"); },
+ // [] { runFillDrain(ROWS, NUM_ROWS, "Row"); },
+ // [] { runFillDrain(COLS, NUM_COLS, "Col"); },
+ // runCheckerboard,
+ // runRowBounce,
+ // runRandom,
+  runMiddleRowOnOuterAlternate,
+};
+
 void loop() {
- // runSingleChase();
-  //runCascade(ROWS, NUM_ROWS, "Row");
-  //runCascade(COLS, NUM_COLS, "Col");
-  runMiddleRowOnOuterAlternate();
+  for (Pattern pattern : PLAYLIST) {
+    pattern();
+  }
 }
