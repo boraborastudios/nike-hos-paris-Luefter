@@ -52,7 +52,7 @@ static constexpr uint8_t REG_CONFIG    = 0x03; // bit=0 -> that pin is an output
 
 // ---------- Chase configuration ----------
 static constexpr uint8_t  NUM_RELAYS       = 8;
-static constexpr uint32_t STEP_INTERVAL_MS = 3000; // gap between each group switching
+static constexpr uint32_t STEP_INTERVAL_MS = 1000; // gap between each group switching
 static constexpr uint32_t PHASE_PAUSE_MS   = 10; // pause between "all on" and "start turning off", and before restarting
 
 // 3x3 grid in reading order, relay indices 0..7 (1-based relay = index+1),
@@ -73,21 +73,21 @@ struct RelayGroup {
 //   middle: relays 7, 5
 //   bottom: relays 4, 6, 8
 static const uint8_t ROW0[] = {0, 1, 2};
-static const uint8_t ROW1[] = {6, 4}; // only 2 relays
+static const uint8_t ROW1[] = {6, 4}; //9//// only 2 relays
 static const uint8_t ROW2[] = {3, 5, 7};
 static const RelayGroup ROWS[] = {GROUP(ROW0), GROUP(ROW1), GROUP(ROW2)};
 static constexpr uint8_t NUM_ROWS = sizeof(ROWS) / sizeof(ROWS[0]);
 
 static const uint8_t COL0[] = {0, 3, 6};
 static const uint8_t COL1[] = {1, 4, 7};
-static const uint8_t COL2[] = {2, 5}; // bottom-right missing
+static const uint8_t COL2[] = {2, 5}; //9// bottom-right missing
 static const RelayGroup COLS[] = {GROUP(COL0), GROUP(COL1), GROUP(COL2)};
 static constexpr uint8_t NUM_COLS = sizeof(COLS) / sizeof(COLS[0]);
 
 // How many times top/bottom swap in runMiddleRowOnOuterAlternate().
 static constexpr uint8_t SIDE_SWAPS = 6;
 // Middle row switches off for this last part of each step, before the swap.
-static constexpr uint32_t MIDDLE_OFF_PERCENT = 30;
+static constexpr uint32_t MIDDLE_OFF_PERCENT = 20;
 
 static uint8_t relayBits = 0x00; // current shadow copy of the TCA9554 output register
 
